@@ -1,0 +1,17 @@
+# Build outputs
+release/
+LatencyMonitor.exe
+config.json
+Payload/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# iOS / Xcode
+ios/build/
+ios/*.xcodeproj/
+ios/Sources/Info.plist
+.DS_Store

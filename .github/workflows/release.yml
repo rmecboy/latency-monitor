@@ -1,0 +1,149 @@
+name: Build & Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (e.g. v1.1.0)'
+        required: true
+        default: 'v1.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Windows EXE
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\build.ps1 -Release
+
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: release/LatencyMonitor.exe
+          if-no-files-found: error
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Android APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon
+
+      - name: Prepare APK
+        run: |
+          mkdir -p release
+          cp android/app/build/outputs/apk/release/app-release.apk release/LatencyMonitor.apk
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: release/LatencyMonitor.apk
+          if-no-files-found: error
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build unsigned iPadOS / iOS App
+        run: |
+          xcodebuild \
+            -project ios/LatencyMonitor.xcodeproj \
+            -scheme LatencyMonitor \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          rm -rf Payload release/LatencyMonitor.ipa
+          mkdir -p Payload release
+          cp -R ios/build/Build/Products/Release-iphoneos/LatencyMonitor.app Payload/
+          zip -r -y release/LatencyMonitor.ipa Payload
+          ls -lh release/LatencyMonitor.ipa
+
+      - name: Upload iPadOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: release/LatencyMonitor.ipa
+          if-no-files-found: error
+
+  publish-release:
+    needs: [build-windows, build-android, build-ios]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify artifacts
+        run: ls -lh dist/
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "LatencyMonitor ${{ steps.tag.outputs.name }}"
+          draft: false
+          prerelease: false
+          body: |
+            ## 网络延迟与地域悬浮窗（全平台三端发布）
+
+            实时显示 **Google / Cloudflare / Oracle** 延迟（`< 800ms` 绿色）与当前网络地域（不显示 IP）：
+
+            - **Windows (`LatencyMonitor.exe`)**：单文件免安装桌面悬浮窗，双击即用，支持横/纵切换、鼠标穿透与托盘隐藏。
+            - **Android (`LatencyMonitor.apk`)**：极小地域胶囊悬浮窗，单击展开/收起延迟详情，支持 Android 8.0 ~ 15/16。
+            - **iPadOS / iOS (`LatencyMonitor.ipa`)**：适配 iPad mini 5 的原生画中画（PiP）悬浮窗（未签名 `.ipa`，支持 TrollStore 巨魔或 Sideloadly / 爱思助手签名安装）。
+          files: |
+            dist/LatencyMonitor.exe
+            dist/LatencyMonitor.apk
+            dist/LatencyMonitor.ipa

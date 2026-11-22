@@ -1,0 +1,44 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/build-android.yml'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Android APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon
+
+      - name: Prepare APK artifact
+        run: |
+          mkdir -p release
+          cp android/app/build/outputs/apk/release/app-release.apk release/LatencyMonitor.apk
+          ls -lh release/LatencyMonitor.apk
+
+      - name: Upload LatencyMonitor.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: LatencyMonitor-Android-APK
+          path: release/LatencyMonitor.apk
+          if-no-files-found: error

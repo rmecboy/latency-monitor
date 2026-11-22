@@ -1,0 +1,50 @@
+name: LatencyMonitor
+options:
+  bundleIdPrefix: com.latencymonitor
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "16.0"
+
+targets:
+  LatencyMonitor:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Sources
+        excludes:
+          - Info.plist
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: 网络延迟悬浮窗
+        CFBundleName: LatencyMonitor
+        CFBundleShortVersionString: "1.1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+        UIBackgroundModes:
+          - audio
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.latencymonitor.ipad
+        PRODUCT_NAME: LatencyMonitor
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        DEVELOPMENT_TEAM: ""
+        ENABLE_BITCODE: "NO"
+        SUPPORTS_MACCATALYST: "NO"
