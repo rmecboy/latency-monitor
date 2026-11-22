@@ -1,10 +1,16 @@
 import Foundation
 import Network
 
-struct ProbeResult {
-    let targetId: String
+struct TargetItem: Identifiable, Equatable {
+    let id: String
     let name: String
-    let shortName: String
+    let url: String
+    let host: String
+    let port: UInt16
+    let method: String
+}
+
+struct ProbeResult: Equatable {
     let success: Bool
     let latencyMs: Int
     let detail: String
@@ -25,125 +31,83 @@ private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
 enum LatencyProber {
     private static let noRedirectDelegate = NoRedirectDelegate()
 
-    static func probeAll(targets: [TargetItem], mode: ProbeMode, timeoutSec: TimeInterval = 3.0) async -> [ProbeResult] {
-        await withTaskGroup(of: (Int, ProbeResult).self) { group in
-            for (idx, target) in targets.enumerated() {
-                group.addTask {
-                    let result = await probe(target: target, mode: mode, timeoutSec: timeoutSec)
-                    return (idx, result)
-                }
-            }
-            var ordered = Array<ProbeResult?>(repeating: nil, count: targets.count)
-            for await (idx, res) in group {
-                ordered[idx] = res
-            }
-            return ordered.compactMap { $0 }
+    static func probe(target: TargetItem, mode: String, timeoutSec: TimeInterval) async -> ProbeResult {
+        if mode.uppercased() == "TCP" {
+            return await probeTcp(host: target.host, port: target.port, timeoutSec: timeoutSec)
         }
+        return await probeHttps(target: target, timeoutSec: timeoutSec)
     }
 
-    static func probe(target: TargetItem, mode: ProbeMode, timeoutSec: TimeInterval = 3.0) async -> ProbeResult {
-        switch mode {
-        case .https:
-            return await probeHTTPS(target: target, timeoutSec: timeoutSec)
-        case .tcp:
-            return await probeTCP(target: target, timeoutSec: timeoutSec)
-        }
-    }
-
-    private static func probeHTTPS(target: TargetItem, timeoutSec: TimeInterval) async -> ProbeResult {
-        guard let url = URL(string: target.normalizedUrl) else {
-            return ProbeResult(targetId: target.id, name: target.name, shortName: target.shortName, success: false, latencyMs: -1, detail: "Invalid URL")
+    private static func probeHttps(target: TargetItem, timeoutSec: TimeInterval) async -> ProbeResult {
+        guard let url = URL(string: target.url) else {
+            return ProbeResult(success: false, latencyMs: -1, detail: "Invalid URL")
         }
 
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = timeoutSec
-        cfg.timeoutIntervalForResource = timeoutSec
-        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.waitsForConnectivity = false
-        let session = URLSession(configuration: cfg, delegate: noRedirectDelegate, delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = timeoutSec
+        config.timeoutIntervalForResource = timeoutSec
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.httpShouldUsePipelining = false
 
-        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeoutSec)
+        let session = URLSession(configuration: config, delegate: noRedirectDelegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeoutSec)
         req.httpMethod = target.method
         req.setValue("close", forHTTPHeaderField: "Connection")
         req.setValue(
-            "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             forHTTPHeaderField: "User-Agent"
         )
 
         let start = CFAbsoluteTimeGetCurrent()
         do {
             let (_, response) = try await session.data(for: req)
-            let elapsedMs = max(1, Int(((CFAbsoluteTimeGetCurrent() - start) * 1000.0).rounded()))
+            let elapsed = max(1, Int((CFAbsoluteTimeGetCurrent() - start) * 1000.0))
             let code = (response as? HTTPURLResponse)?.statusCode ?? 200
-            return ProbeResult(
-                targetId: target.id,
-                name: target.name,
-                shortName: target.shortName,
-                success: true,
-                latencyMs: elapsedMs,
-                detail: "HTTP \(code)"
-            )
+            return ProbeResult(success: true, latencyMs: elapsed, detail: "HTTP \(code)")
         } catch {
-            return ProbeResult(
-                targetId: target.id,
-                name: target.name,
-                shortName: target.shortName,
-                success: false,
-                latencyMs: -1,
-                detail: "超时"
-            )
+            return ProbeResult(success: false, latencyMs: -1, detail: "超时")
         }
     }
 
-    private static func probeTCP(target: TargetItem, timeoutSec: TimeInterval) async -> ProbeResult {
-        let host = NWEndpoint.Host(target.host)
-        let portNum = UInt16(clamping: target.port > 0 ? target.port : 443)
-        guard let port = NWEndpoint.Port(rawValue: portNum) else {
-            return ProbeResult(targetId: target.id, name: target.name, shortName: target.shortName, success: false, latencyMs: -1, detail: "Invalid Port")
+    private static func probeTcp(host: String, port: UInt16, timeoutSec: TimeInterval) async -> ProbeResult {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            return ProbeResult(success: false, latencyMs: -1, detail: "Invalid Port")
         }
 
-        let start = CFAbsoluteTimeGetCurrent()
         return await withCheckedContinuation { continuation in
-            let queue = DispatchQueue(label: "com.latencymonitor.tcp.\(target.id)")
-            let connection = NWConnection(host: host, port: port, using: .tcp)
-            let lock = NSLock()
+            let queue = DispatchQueue(label: "com.latencymonitor.tcp.\(UUID().uuidString)")
+            let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+            let start = CFAbsoluteTimeGetCurrent()
             var finished = false
 
-            func finish(success: Bool, detail: String) {
-                lock.lock()
-                defer { lock.unlock() }
-                guard !finished else { return }
+            let finish: (ProbeResult) -> Void = { result in
+                if finished { return }
                 finished = true
-                connection.stateUpdateHandler = nil
-                connection.cancel()
-                let elapsedMs = max(1, Int(((CFAbsoluteTimeGetCurrent() - start) * 1000.0).rounded()))
-                continuation.resume(returning: ProbeResult(
-                    targetId: target.id,
-                    name: target.name,
-                    shortName: target.shortName,
-                    success: success,
-                    latencyMs: success ? elapsedMs : -1,
-                    detail: detail
-                ))
+                conn.stateUpdateHandler = nil
+                conn.cancel()
+                continuation.resume(returning: result)
             }
 
-            connection.stateUpdateHandler = { state in
+            conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    finish(success: true, detail: "TCP :\(portNum)")
+                    let elapsed = max(1, Int((CFAbsoluteTimeGetCurrent() - start) * 1000.0))
+                    finish(ProbeResult(success: true, latencyMs: elapsed, detail: "TCP :\(port)"))
                 case .failed:
-                    finish(success: false, detail: "连接失败")
+                    finish(ProbeResult(success: false, latencyMs: -1, detail: "连接失败"))
+                case .cancelled:
+                    finish(ProbeResult(success: false, latencyMs: -1, detail: "已取消"))
                 default:
                     break
                 }
             }
 
+            conn.start(queue: queue)
             queue.asyncAfter(deadline: .now() + timeoutSec) {
-                finish(success: false, detail: "超时")
+                finish(ProbeResult(success: false, latencyMs: -1, detail: "超时"))
             }
-
-            connection.start(queue: queue)
         }
     }
 }

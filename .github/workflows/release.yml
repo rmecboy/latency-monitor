@@ -138,11 +138,26 @@ jobs:
           body: |
             ## 网络延迟与地域悬浮窗（全平台三端发布）
 
-            实时显示 **Google / Cloudflare / Oracle** 延迟（`< 800ms` 绿色）与当前网络地域（不显示 IP）：
+            实时显示 **Google / Cloudflare / Oracle** 延迟（`< 800ms` 绿色）与当前网络地域（不显示 IP）。
 
-            - **Windows (`LatencyMonitor.exe`)**：单文件免安装桌面悬浮窗，双击即用，支持横/纵切换、鼠标穿透与托盘隐藏。
-            - **Android (`LatencyMonitor.apk`)**：极小地域胶囊悬浮窗，单击展开/收起延迟详情，支持 Android 8.0 ~ 15/16。
-            - **iPadOS / iOS (`LatencyMonitor.ipa`)**：适配 iPad mini 5 的原生画中画（PiP）悬浮窗（未签名 `.ipa`，支持 TrollStore 巨魔或 Sideloadly / 爱思助手签名安装）。
+            ### v1.2.0 更新：手机端也能看到详细信息
+
+            **Android (`LatencyMonitor.apk`)**
+            - 单击任意一行 → 展开该目标的详细信息：目标地址、当前延迟与 HTTP 状态、更新时间、**最近 20 次平均 / 最低 / 最高**
+            - 单击底部地域行 → 展开地域详情：国家/地区、省份/州、城市、**运营商 / ASN**、数据来源与刷新时间
+            - 所有行都可以直接拖动悬浮窗；单击空白处仍是展开/收起
+
+            **iOS / iPadOS (`LatencyMonitor.ipa`)**
+            - 画中画卡片新增每个目标的一行详情：`延迟 · HTTP 状态 · 均/低/高`
+            - 地域行下方新增一行：`运营商 · ASN`
+
+            **Windows (`LatencyMonitor.exe`)**
+            - 地域悬停提示新增 **ASN**（如 `AS45102`），与运营商一起显示，便于判断「IP 注册地」与「节点名」是否一致
+
+            ### 安装说明
+            - **Windows**：单文件免安装，双击即用（需系统自带 .NET Framework 4.x）
+            - **Android**：Android 8.0+，安装后授予「显示在其他应用上层」权限
+            - **iOS**：未签名 `.ipa`，支持 TrollStore 巨魔或 Sideloadly / AltStore 自签安装，使用画中画悬浮窗
           files: |
             dist/LatencyMonitor.exe
             dist/LatencyMonitor.apk

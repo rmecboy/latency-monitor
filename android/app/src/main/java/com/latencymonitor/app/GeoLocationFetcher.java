@@ -18,12 +18,70 @@ public class GeoLocationFetcher {
         public final boolean success;
         public final String displayText;
         public final String source;
+        public final String country;
+        public final String region;
+        public final String city;
+        public final String isp;
+        public final String asn;
+        public final long updatedAt;
 
-        public GeoInfo(boolean success, String displayText, String source) {
+        public GeoInfo(boolean success, String displayText, String source,
+                       String country, String region, String city, String isp, String asn) {
             this.success = success;
             this.displayText = displayText;
             this.source = source;
+            this.country = country == null ? "" : country;
+            this.region = region == null ? "" : region;
+            this.city = city == null ? "" : city;
+            this.isp = isp == null ? "" : isp;
+            this.asn = asn == null ? "" : asn;
+            this.updatedAt = System.currentTimeMillis();
         }
+
+        public static GeoInfo failure(String text) {
+            return new GeoInfo(false, text, "", "", "", "", "", "");
+        }
+
+        /** 运营商 + ASN 组成的一行摘要，供悬浮窗详情使用（不包含 IP）。 */
+        public String secondaryLine() {
+            if (!success) return "";
+            StringBuilder sb = new StringBuilder();
+            if (!isp.isEmpty()) sb.append(isp);
+            if (!asn.isEmpty()) {
+                if (sb.length() > 0) sb.append(" · ");
+                sb.append(asn);
+            }
+            return sb.toString();
+        }
+    }
+
+    /** 把 "45102" / "AS45102" / "AS45102 Alibaba" 统一成 "AS45102"。 */
+    static String normalizeAsn(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.isEmpty()) return "";
+        if (s.regionMatches(true, 0, "AS", 0, 2)) {
+            int i = 2;
+            while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+            return i > 2 ? "AS" + s.substring(2, i) : "";
+        }
+        int i = 0;
+        while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+        return i > 0 ? "AS" + s.substring(0, i) : "";
+    }
+
+    /** 从 ipinfo 的 org（"AS45102 Alibaba (US) Technology Co., Ltd."）里拆出 ASN 与运营商名。 */
+    static String orgToIsp(String org) {
+        if (org == null) return "";
+        String s = org.trim();
+        if (s.regionMatches(true, 0, "AS", 0, 2)) {
+            int i = 2;
+            while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+            if (i > 2) {
+                return s.substring(i).trim();
+            }
+        }
+        return s;
     }
 
     private static final Map<String, String> COUNTRY_NAMES = new HashMap<>();
@@ -166,7 +224,7 @@ public class GeoLocationFetcher {
         info = tryCloudflareTrace(t);
         if (info != null && info.success) return info;
 
-        return new GeoInfo(false, "地域获取失败", "");
+        return GeoInfo.failure("地域获取失败");
     }
 
     private static String httpGet(String urlStr, int timeoutMs) {
@@ -209,16 +267,19 @@ public class GeoLocationFetcher {
     }
 
     private static GeoInfo tryIpApi(int timeoutMs) {
-        String body = httpGet("http://ip-api.com/json/?lang=zh-CN&fields=status,country,countryCode,regionName,city", timeoutMs);
+        String body = httpGet("http://ip-api.com/json/?lang=zh-CN&fields=status,country,countryCode,regionName,city,isp,as", timeoutMs);
         if (body == null) return null;
         try {
             JSONObject obj = new JSONObject(body);
             if (!"success".equalsIgnoreCase(obj.optString("status"))) return null;
+            String asRaw = obj.optString("as");
             return buildGeo(
                     obj.optString("countryCode"),
                     obj.optString("country"),
                     obj.optString("regionName"),
                     obj.optString("city"),
+                    obj.optString("isp"),
+                    normalizeAsn(asRaw),
                     "ip-api.com"
             );
         } catch (Exception e) {
@@ -234,7 +295,10 @@ public class GeoLocationFetcher {
             String code = obj.optString("country_code");
             String country = obj.optString("country");
             if (code.isEmpty() && country.isEmpty()) return null;
-            return buildGeo(code, country, obj.optString("region"), obj.optString("city"), "api.ip.sb");
+            String isp = obj.optString("isp");
+            if (isp.isEmpty()) isp = obj.optString("organization");
+            return buildGeo(code, country, obj.optString("region"), obj.optString("city"),
+                    isp, normalizeAsn(obj.optString("asn")), "api.ip.sb");
         } catch (Exception e) {
             return null;
         }
@@ -249,7 +313,15 @@ public class GeoLocationFetcher {
             String code = obj.optString("country_code");
             String country = obj.optString("country");
             if (code.isEmpty() && country.isEmpty()) return null;
-            return buildGeo(code, country, obj.optString("region"), obj.optString("city"), "ipwho.is");
+            String isp = "";
+            String asn = "";
+            JSONObject conn = obj.optJSONObject("connection");
+            if (conn != null) {
+                isp = conn.optString("isp");
+                if (isp.isEmpty()) isp = conn.optString("org");
+                asn = normalizeAsn(conn.optString("asn"));
+            }
+            return buildGeo(code, country, obj.optString("region"), obj.optString("city"), isp, asn, "ipwho.is");
         } catch (Exception e) {
             return null;
         }
@@ -262,7 +334,9 @@ public class GeoLocationFetcher {
             JSONObject obj = new JSONObject(body);
             String code = obj.optString("country");
             if (code.isEmpty()) return null;
-            return buildGeo(code, "", obj.optString("region"), obj.optString("city"), "ipinfo.io");
+            String org = obj.optString("org");
+            return buildGeo(code, "", obj.optString("region"), obj.optString("city"),
+                    orgToIsp(org), normalizeAsn(org), "ipinfo.io");
         } catch (Exception e) {
             return null;
         }
@@ -276,14 +350,15 @@ public class GeoLocationFetcher {
             if (line.startsWith("loc=")) {
                 String loc = line.substring(4).trim();
                 if (!loc.isEmpty()) {
-                    return buildGeo(loc, "", "", "", "Cloudflare");
+                    return buildGeo(loc, "", "", "", "", "", "Cloudflare");
                 }
             }
         }
         return null;
     }
 
-    private static GeoInfo buildGeo(String rawCode, String rawCountry, String rawRegion, String rawCity, String source) {
+    private static GeoInfo buildGeo(String rawCode, String rawCountry, String rawRegion, String rawCity,
+                                    String rawIsp, String rawAsn, String source) {
         String code = rawCode == null ? "" : rawCode.trim().toUpperCase(Locale.US);
         String country = translateCountry(code, rawCountry);
         String region = translatePlace(rawRegion);
@@ -293,7 +368,7 @@ public class GeoLocationFetcher {
         if (display == null || display.trim().isEmpty()) {
             return null;
         }
-        return new GeoInfo(true, display, source);
+        return new GeoInfo(true, display, source, country, region, city, rawIsp, rawAsn);
     }
 
     private static String translateCountry(String code, String rawCountry) {

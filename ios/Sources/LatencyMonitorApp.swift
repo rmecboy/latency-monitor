@@ -1,249 +1,408 @@
+import Combine
 import SwiftUI
 
-@main
-struct LatencyMonitorApp: App {
-    @StateObject private var config: AppConfig
-    @StateObject private var pipManager: PiPManager
+@MainActor
+final class MonitorViewModel: ObservableObject {
+    @Published var mode: String {
+        didSet { UserDefaults.standard.set(mode, forKey: "mode"); pushFrame() }
+    }
+    @Published var intervalSec: Int {
+        didSet { UserDefaults.standard.set(intervalSec, forKey: "interval_sec"); restartProbeLoop() }
+    }
+    @Published var compactHorizontal: Bool {
+        didSet { UserDefaults.standard.set(compactHorizontal, forKey: "compact_horizontal"); pushFrame() }
+    }
+    @Published var showGeoLocation: Bool {
+        didSet {
+            UserDefaults.standard.set(showGeoLocation, forKey: "show_geo_location")
+            pushFrame()
+            if showGeoLocation { refreshGeo() }
+        }
+    }
+    @Published var googleUrl: String
+    @Published var cloudflareUrl: String
+    @Published var oracleUrl: String
+
+    @Published var results: [String: ProbeResult] = [:]
+    @Published var geoInfo: GeoInfo = GeoInfo.empty
+    @Published var isPiPActive: Bool = false
+    @Published var pipStatus: String = ""
+
+    let pipManager = PiPManager()
+    private var probeTask: Task<Void, Never>?
+    private var geoTask: Task<Void, Never>?
+    private var history: [String: [Int]] = [:]
 
     init() {
-        let cfg = AppConfig()
-        _config = StateObject(wrappedValue: cfg)
-        _pipManager = StateObject(wrappedValue: PiPManager(config: cfg))
+        let ud = UserDefaults.standard
+        self.mode = ud.string(forKey: "mode") ?? "HTTPS"
+        let savedInterval = ud.integer(forKey: "interval_sec")
+        self.intervalSec = savedInterval >= 2 ? savedInterval : 3
+        self.compactHorizontal = ud.bool(forKey: "compact_horizontal")
+        if ud.object(forKey: "show_geo_location") != nil {
+            self.showGeoLocation = ud.bool(forKey: "show_geo_location")
+        } else {
+            self.showGeoLocation = true
+        }
+        self.googleUrl = ud.string(forKey: "google_url") ?? "https://www.google.com/generate_204"
+        self.cloudflareUrl = ud.string(forKey: "cloudflare_url") ?? "https://cp.cloudflare.com/generate_204"
+        self.oracleUrl = ud.string(forKey: "oracle_url") ?? "https://www.oracle.com/favicon.ico"
+
+        pipManager.$isPiPActive.assign(to: &$isPiPActive)
+        pipManager.$statusMessage.assign(to: &$pipStatus)
     }
 
-    var body: some Scene {
-        WindowGroup {
-            ContentView(config: config, pipManager: pipManager)
-                .preferredColorScheme(.dark)
+    var targets: [TargetItem] {
+        return [
+            makeTarget(id: "google", name: "Google", rawUrl: googleUrl, fallbackUrl: "https://www.google.com/generate_204", fallbackHost: "www.google.com", method: "GET"),
+            makeTarget(id: "cloudflare", name: "Cloudflare", rawUrl: cloudflareUrl, fallbackUrl: "https://cp.cloudflare.com/generate_204", fallbackHost: "1.1.1.1", method: "GET"),
+            makeTarget(id: "oracle", name: "Oracle", rawUrl: oracleUrl, fallbackUrl: "https://www.oracle.com/favicon.ico", fallbackHost: "www.oracle.com", method: "HEAD")
+        ]
+    }
+
+    func start() {
+        pipManager.configureIfNeeded()
+        pushFrame()
+        restartProbeLoop()
+        restartGeoLoop()
+    }
+
+    func saveUrls() {
+        let ud = UserDefaults.standard
+        ud.set(googleUrl.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "google_url")
+        ud.set(cloudflareUrl.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "cloudflare_url")
+        ud.set(oracleUrl.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "oracle_url")
+        refreshAll()
+    }
+
+    func togglePiP() {
+        pipManager.togglePiP(
+            targets: targets,
+            results: results,
+            details: detailLines(),
+            geoText: geoInfo.displayText,
+            geoDetail: geoInfo.detailLine,
+            geoSuccess: geoInfo.success,
+            showGeo: showGeoLocation,
+            mode: mode,
+            compactHorizontal: compactHorizontal
+        )
+    }
+
+    /// 每个目标的一行详细信息：延迟 · 状态 · 近 20 次统计 · 目标主机
+    func detailLines() -> [String: String] {
+        var map: [String: String] = [:]
+        for t in targets {
+            var parts: [String] = []
+            if let r = results[t.id] {
+                parts.append(r.success ? "\(r.latencyMs)ms" : "失败")
+                if !r.detail.isEmpty { parts.append(r.detail) }
+            } else {
+                parts.append("--")
+            }
+            if let s = statsLine(for: t.id) { parts.append(s) }
+            parts.append(t.host)
+            map[t.id] = parts.joined(separator: " · ")
         }
+        return map
+    }
+
+    private func statsLine(for id: String) -> String? {
+        guard let arr = history[id], !arr.isEmpty else { return nil }
+        let avg = arr.reduce(0, +) / arr.count
+        let mn = arr.min() ?? 0
+        let mx = arr.max() ?? 0
+        return "均\(avg) 低\(mn) 高\(mx)"
+    }
+
+    func refreshAll() {
+        Task { await runProbeOnce() }
+        if showGeoLocation {
+            refreshGeo()
+        }
+    }
+
+    func refreshGeo() {
+        Task {
+            let info = await GeoLocationFetcher.fetch(timeoutSec: 3.5)
+            self.geoInfo = info
+            self.pushFrame()
+        }
+    }
+
+    private func restartProbeLoop() {
+        probeTask?.cancel()
+        probeTask = Task {
+            while !Task.isCancelled {
+                await runProbeOnce()
+                let sleepNs = UInt64(max(2, intervalSec)) * 1_000_000_000
+                try? await Task.sleep(nanoseconds: sleepNs)
+            }
+        }
+    }
+
+    private func restartGeoLoop() {
+        geoTask?.cancel()
+        geoTask = Task {
+            while !Task.isCancelled {
+                if showGeoLocation {
+                    let info = await GeoLocationFetcher.fetch(timeoutSec: 3.5)
+                    self.geoInfo = info
+                    self.pushFrame()
+                }
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+            }
+        }
+    }
+
+    private func runProbeOnce() async {
+        let currentTargets = targets
+        let currentMode = mode
+        var updated: [String: ProbeResult] = [:]
+
+        await withTaskGroup(of: (String, ProbeResult).self) { group in
+            for item in currentTargets {
+                group.addTask {
+                    let res = await LatencyProber.probe(target: item, mode: currentMode, timeoutSec: 3.0)
+                    return (item.id, res)
+                }
+            }
+            for await (id, res) in group {
+                updated[id] = res
+            }
+        }
+
+        for (id, res) in updated where res.success {
+            var arr = history[id] ?? []
+            arr.append(res.latencyMs)
+            if arr.count > 20 { arr.removeFirst(arr.count - 20) }
+            history[id] = arr
+        }
+
+        self.results = updated
+        self.pushFrame()
+    }
+
+    func pushFrame() {
+        pipManager.updateFrame(
+            targets: targets,
+            results: results,
+            details: detailLines(),
+            geoText: geoInfo.displayText,
+            geoDetail: geoInfo.detailLine,
+            geoSuccess: geoInfo.success,
+            showGeo: showGeoLocation,
+            mode: mode,
+            compactHorizontal: compactHorizontal
+        )
+    }
+
+    private func makeTarget(id: String, name: String, rawUrl: String, fallbackUrl: String, fallbackHost: String, method: String) -> TargetItem {
+        var cleaned = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty { cleaned = fallbackUrl }
+        if !cleaned.hasPrefix("http://") && !cleaned.hasPrefix("https://") {
+            cleaned = "https://" + cleaned
+        }
+        let parsed = URL(string: cleaned)
+        let host = parsed?.host ?? fallbackHost
+        let port = UInt16(parsed?.port ?? (parsed?.scheme == "http" ? 80 : 443))
+        return TargetItem(id: id, name: name, url: cleaned, host: host, port: port, method: method)
     }
 }
 
 struct ContentView: View {
-    @ObservedObject var config: AppConfig
-    @ObservedObject var pipManager: PiPManager
-
-    private let bgDark = Color(red: 15/255, green: 18/255, blue: 25/255)
-    private let cardBg = Color(red: 24/255, green: 28/255, blue: 38/255)
-    private let greenAccent = Color(red: 52/255, green: 211/255, blue: 153/255)
-    private let amberAccent = Color(red: 251/255, green: 191/255, blue: 36/255)
-    private let redAccent = Color(red: 248/255, green: 113/255, blue: 113/255)
-    private let skyAccent = Color(red: 56/255, green: 189/255, blue: 248/255)
+    @StateObject private var vm = MonitorViewModel()
+    @State private var savedToast = false
 
     var body: some View {
-        NavigationView {
+        ZStack {
+            Color(red: 15.0 / 255.0, green: 18.0 / 255.0, blue: 25.0 / 255.0)
+                .ignoresSafeArea()
+
             ScrollView {
-                VStack(spacing: 16) {
-                    previewCard
-                    controlCard
-                    settingsCard
-                    targetsCard
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("网络延迟悬浮窗")
+                            .font(.system(size: 24, weight: .bold))
+                            .foregroundColor(.white)
+                        Text("Google / Cloudflare / Oracle 延迟（<800ms 绿色）+ 当前网络地域")
+                            .font(.system(size: 12.5))
+                            .foregroundColor(Color(white: 0.65))
+                    }
+
+                    // Live PiP Preview Card
+                    VStack(spacing: 12) {
+                        PiPPreviewRepresentable(hostView: vm.pipManager.hostView)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: vm.compactHorizontal ? 76 : 210)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                            )
+
+                        HStack(spacing: 10) {
+                            Button(action: { vm.togglePiP() }) {
+                                Text(vm.isPiPActive ? "关闭画中画悬浮窗" : "开启画中画悬浮窗")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundColor(vm.isPiPActive ? Color.white : Color(red: 5.0 / 255.0, green: 46.0 / 255.0, blue: 22.0 / 255.0))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                                    .background(
+                                        vm.isPiPActive
+                                            ? Color(red: 239.0 / 255.0, green: 68.0 / 255.0, blue: 68.0 / 255.0)
+                                            : Color(red: 52.0 / 255.0, green: 211.0 / 255.0, blue: 153.0 / 255.0)
+                                    )
+                                    .cornerRadius(10)
+                            }
+
+                            Button(action: { vm.refreshAll() }) {
+                                Text("刷新")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 12)
+                                    .background(Color.white.opacity(0.12))
+                                    .cornerRadius(10)
+                            }
+                        }
+
+                        if !vm.pipStatus.isEmpty {
+                            Text(vm.pipStatus)
+                                .font(.system(size: 12))
+                                .foregroundColor(Color(red: 56.0 / 255.0, green: 189.0 / 255.0, blue: 248.0 / 255.0))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            Text("开启画中画后，切回桌面或任何 App 都会保持悬浮显示（可拖动/缩放）。")
+                                .font(.system(size: 11.5))
+                                .foregroundColor(Color(white: 0.58))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(14)
+                    .background(Color(red: 24.0 / 255.0, green: 28.0 / 255.0, blue: 38.0 / 255.0))
+                    .cornerRadius(14)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                    )
+
+                    // Settings Card
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("显示与测速设置")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(.white)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("测速模式")
+                                .font(.system(size: 12.5))
+                                .foregroundColor(Color(white: 0.65))
+                            Picker("测速模式", selection: $vm.mode) {
+                                Text("HTTPS (走代理/VPN)").tag("HTTPS")
+                                Text("TCP (443)").tag("TCP")
+                            }
+                            .pickerStyle(.segmented)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("刷新频率")
+                                .font(.system(size: 12.5))
+                                .foregroundColor(Color(white: 0.65))
+                            Picker("刷新频率", selection: $vm.intervalSec) {
+                                Text("2秒").tag(2)
+                                Text("3秒").tag(3)
+                                Text("5秒").tag(5)
+                                Text("10秒").tag(10)
+                            }
+                            .pickerStyle(.segmented)
+                        }
+
+                        Toggle("横向迷你条布局", isOn: $vm.compactHorizontal)
+                            .foregroundColor(.white)
+                            .tint(Color(red: 52.0 / 255.0, green: 211.0 / 255.0, blue: 153.0 / 255.0))
+
+                        Toggle("显示当前网络地域（不显示 IP）", isOn: $vm.showGeoLocation)
+                            .foregroundColor(.white)
+                            .tint(Color(red: 56.0 / 255.0, green: 189.0 / 255.0, blue: 248.0 / 255.0))
+                    }
+                    .padding(14)
+                    .background(Color(red: 24.0 / 255.0, green: 28.0 / 255.0, blue: 38.0 / 255.0))
+                    .cornerRadius(14)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                    )
+
+                    // Custom URLs Card
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("自定义测速地址")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(.white)
+
+                        urlField("Google", text: $vm.googleUrl)
+                        urlField("Cloudflare", text: $vm.cloudflareUrl)
+                        urlField("Oracle（可改成你自己的 Oracle Cloud 地址）", text: $vm.oracleUrl)
+
+                        Button(action: {
+                            vm.saveUrls()
+                            savedToast = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                savedToast = false
+                            }
+                        }) {
+                            Text(savedToast ? "已保存并应用 ✓" : "保存并应用地址")
+                                .font(.system(size: 14.5, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 11)
+                                .background(Color(red: 37.0 / 255.0, green: 99.0 / 255.0, blue: 235.0 / 255.0))
+                                .cornerRadius(10)
+                        }
+                        .padding(.top, 4)
+                    }
+                    .padding(14)
+                    .background(Color(red: 24.0 / 255.0, green: 28.0 / 255.0, blue: 38.0 / 255.0))
+                    .cornerRadius(14)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                    )
                 }
                 .padding(16)
-                .frame(maxWidth: 600)
-                .frame(maxWidth: .infinity)
-            }
-            .background(bgDark.ignoresSafeArea())
-            .navigationTitle("网络延迟悬浮窗")
-            .navigationBarTitleDisplayMode(.inline)
-        }
-        .navigationViewStyle(.stack)
-    }
-
-    private var previewCard: some View {
-        let px = PiPRenderer.pixelSize(for: config.pipStyle)
-        let ratio = CGFloat(px.width) / CGFloat(px.height)
-
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("实时悬浮窗预览")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundColor(.gray)
-                Spacer()
-                Text(pipManager.statusMessage)
-                    .font(.caption)
-                    .foregroundColor(pipManager.isPiPActive ? greenAccent : .gray)
-            }
-
-            PiPPreviewContainer(manager: pipManager)
-                .aspectRatio(ratio, contentMode: .fit)
-                .frame(maxHeight: config.pipStyle == .detailCard ? 160 : 66)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                )
-                .frame(maxWidth: .infinity)
-
-            HStack(spacing: 12) {
-                Button(action: { pipManager.togglePiP() }) {
-                    HStack {
-                        Image(systemName: pipManager.isPiPActive ? "pip.exit" : "pip.enter")
-                        Text(pipManager.isPiPActive ? "关闭画中画悬浮窗" : "开启画中画悬浮窗")
-                            .fontWeight(.bold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(pipManager.isPiPActive ? redAccent : greenAccent)
-                    .foregroundColor(Color.black.opacity(0.88))
-                    .cornerRadius(10)
-                }
-
-                Button(action: { pipManager.refreshNow() }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.headline)
-                        .padding(12)
-                        .background(Color.white.opacity(0.1))
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
-                }
-            }
-
-            Text("提示：开启后返回桌面或切换其他 App 即可悬浮置顶；双指捏合可缩到极小，点画中画中间按钮可在「极简纯地域 / 详细卡片」间切换。")
-                .font(.caption)
-                .foregroundColor(.gray)
-        }
-        .padding(14)
-        .background(cardBg)
-        .cornerRadius(14)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.1), lineWidth: 1))
-    }
-
-    private var controlCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("当前网络状态")
-                    .font(.headline)
-                Spacer()
-                HStack(spacing: 5) {
-                    Image(systemName: "location.fill")
-                        .font(.caption)
-                        .foregroundColor(skyAccent)
-                    Text(pipManager.geoInfo?.displayText ?? "定位中...")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundColor(.white)
-                }
-            }
-
-            Divider().background(Color.white.opacity(0.15))
-
-            ForEach(config.targets) { target in
-                let res = pipManager.results.first(where: { $0.targetId == target.id })
-                HStack {
-                    Circle()
-                        .fill(statusColor(for: res))
-                        .frame(width: 8, height: 8)
-                    Text(target.name)
-                        .font(.body)
-                        .foregroundColor(.white)
-                    Spacer()
-                    Text(latencyText(for: res))
-                        .font(.system(.body, design: .monospaced).weight(.bold))
-                        .foregroundColor(statusColor(for: res))
-                }
             }
         }
-        .padding(14)
-        .background(cardBg)
-        .cornerRadius(14)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.1), lineWidth: 1))
-    }
-
-    private var settingsCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("显示与测速设置")
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("画中画悬浮样式")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-                Picker("样式", selection: $config.pipStyle) {
-                    ForEach(PiPStyle.allCases) { style in
-                        Text(style.label).tag(style)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: config.pipStyle) { _ in
-                    pipManager.applyStyleChange()
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("测速模式")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-                Picker("模式", selection: $config.mode) {
-                    ForEach(ProbeMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: config.mode) { _ in
-                    pipManager.refreshNow()
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("刷新间隔")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-                Picker("间隔", selection: $config.intervalSeconds) {
-                    Text("2秒").tag(2)
-                    Text("3秒").tag(3)
-                    Text("5秒").tag(5)
-                    Text("10秒").tag(10)
-                }
-                .pickerStyle(.segmented)
-            }
+        .preferredColorScheme(.dark)
+        .onAppear {
+            vm.start()
         }
-        .padding(14)
-        .background(cardBg)
-        .cornerRadius(14)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.1), lineWidth: 1))
     }
 
-    private var targetsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("自定义测速地址")
-                .font(.headline)
-
-            urlField(title: "Google", text: $config.googleUrl)
-            urlField(title: "Cloudflare", text: $config.cloudflareUrl)
-            urlField(title: "Oracle（可替换成你自己的 Oracle Cloud 地址）", text: $config.oracleUrl)
-        }
-        .padding(14)
-        .background(cardBg)
-        .cornerRadius(14)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.1), lineWidth: 1))
-    }
-
-    private func urlField(title: String, text: Binding<String>) -> some View {
+    private func urlField(_ label: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption)
-                .foregroundColor(.gray)
+            Text(label)
+                .font(.system(size: 12))
+                .foregroundColor(Color(white: 0.65))
             TextField("", text: text)
-                .textInputAutocapitalization(.never)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(.white)
+                .autocapitalization(.none)
                 .disableAutocorrection(true)
-                .font(.system(.footnote, design: .monospaced))
-                .padding(9)
-                .background(bgDark)
+                .padding(10)
+                .background(Color(red: 17.0 / 255.0, green: 21.0 / 255.0, blue: 30.0 / 255.0))
                 .cornerRadius(8)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.12), lineWidth: 1))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
         }
     }
+}
 
-    private func latencyText(for res: ProbeResult?) -> String {
-        guard let res = res else { return "-- ms" }
-        return res.success ? "\(res.latencyMs) ms" : "超时"
-    }
-
-    private func statusColor(for res: ProbeResult?) -> Color {
-        guard let res = res else { return .gray }
-        if !res.success { return redAccent }
-        if res.latencyMs < 800 { return greenAccent }
-        if res.latencyMs <= 1500 { return amberAccent }
-        return redAccent
+@main
+struct LatencyMonitorApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
     }
 }

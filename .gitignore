@@ -13,5 +13,4 @@ android/local.properties
 # iOS / Xcode
 ios/build/
 ios/*.xcodeproj/
-ios/Sources/Info.plist
 .DS_Store

@@ -424,6 +424,7 @@ namespace LatencyMonitor
         public string Region { get; set; }
         public string City { get; set; }
         public string Isp { get; set; }
+        public string Asn { get; set; }
         public string Source { get; set; }
         public string DisplayText { get; set; }
         public DateTime UpdatedAt { get; set; }
@@ -435,6 +436,7 @@ namespace LatencyMonitor
             Region = "";
             City = "";
             Isp = "";
+            Asn = "";
             Source = "";
             DisplayText = "获取地域中...";
             UpdatedAt = DateTime.Now;
@@ -468,6 +470,11 @@ namespace LatencyMonitor
             if (!string.IsNullOrWhiteSpace(Isp))
             {
                 sb.AppendFormat("运营商: {0}", Isp);
+                sb.AppendLine();
+            }
+            if (!string.IsNullOrWhiteSpace(Asn))
+            {
+                sb.AppendFormat("ASN: {0}", Asn);
                 sb.AppendLine();
             }
             if (!string.IsNullOrWhiteSpace(Source))
@@ -640,7 +647,7 @@ namespace LatencyMonitor
 
         private static async Task<GeoLocationInfo> TryIpApiAsync(int timeoutMs)
         {
-            string body = await HttpGetStringAsync("http://ip-api.com/json/?lang=zh-CN&fields=status,country,countryCode,regionName,city,isp", timeoutMs);
+            string body = await HttpGetStringAsync("http://ip-api.com/json/?lang=zh-CN&fields=status,country,countryCode,regionName,city,isp,as", timeoutMs);
             var dict = ParseJsonDict(body);
             if (dict == null) return null;
             if (!string.Equals(GetStr(dict, "status"), "success", StringComparison.OrdinalIgnoreCase)) return null;
@@ -651,6 +658,7 @@ namespace LatencyMonitor
                 GetStr(dict, "regionName"),
                 GetStr(dict, "city"),
                 GetStr(dict, "isp"),
+                NormalizeAsn(GetStr(dict, "as")),
                 "ip-api.com"
             );
         }
@@ -674,6 +682,7 @@ namespace LatencyMonitor
                 GetStr(dict, "region"),
                 GetStr(dict, "city"),
                 isp,
+                NormalizeAsn(GetStr(dict, "asn")),
                 "api.ip.sb"
             );
         }
@@ -692,12 +701,14 @@ namespace LatencyMonitor
             if (string.IsNullOrEmpty(code) && string.IsNullOrEmpty(country)) return null;
 
             string isp = "";
+            string asn = "";
             object connObj;
             if (dict.TryGetValue("connection", out connObj) && connObj is Dictionary<string, object>)
             {
                 var connDict = (Dictionary<string, object>)connObj;
                 isp = GetStr(connDict, "isp");
                 if (string.IsNullOrEmpty(isp)) isp = GetStr(connDict, "org");
+                asn = NormalizeAsn(GetStr(connDict, "asn"));
             }
 
             return BuildGeoInfo(
@@ -706,6 +717,7 @@ namespace LatencyMonitor
                 GetStr(dict, "region"),
                 GetStr(dict, "city"),
                 isp,
+                asn,
                 "ipwho.is"
             );
         }
@@ -719,12 +731,14 @@ namespace LatencyMonitor
             string code = GetStr(dict, "country");
             if (string.IsNullOrEmpty(code)) return null;
 
+            string org = GetStr(dict, "org");
             return BuildGeoInfo(
                 code,
                 "",
                 GetStr(dict, "region"),
                 GetStr(dict, "city"),
-                GetStr(dict, "org"),
+                OrgToIsp(org),
+                NormalizeAsn(org),
                 "ipinfo.io"
             );
         }
@@ -748,10 +762,34 @@ namespace LatencyMonitor
 
             if (string.IsNullOrEmpty(loc)) return null;
 
-            return BuildGeoInfo(loc, "", "", "", "", "Cloudflare");
+            return BuildGeoInfo(loc, "", "", "", "", "", "Cloudflare");
         }
 
-        private static GeoLocationInfo BuildGeoInfo(string countryCode, string rawCountry, string rawRegion, string rawCity, string isp, string source)
+        /// <summary>把 "45102" / "AS45102" / "AS45102 Alibaba" 统一成 "AS45102"。</summary>
+        private static string NormalizeAsn(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return "";
+            string s = raw.Trim();
+            int start = s.StartsWith("AS", StringComparison.OrdinalIgnoreCase) ? 2 : 0;
+            int i = start;
+            while (i < s.Length && char.IsDigit(s[i])) i++;
+            if (i == start) return "";
+            return "AS" + s.Substring(start, i - start);
+        }
+
+        /// <summary>从 ipinfo 的 org（"AS45102 Alibaba (US) Technology Co., Ltd."）拆出运营商名。</summary>
+        private static string OrgToIsp(string org)
+        {
+            if (string.IsNullOrWhiteSpace(org)) return "";
+            string s = org.Trim();
+            if (!s.StartsWith("AS", StringComparison.OrdinalIgnoreCase)) return s;
+            int i = 2;
+            while (i < s.Length && char.IsDigit(s[i])) i++;
+            if (i == 2) return s;
+            return s.Substring(i).Trim();
+        }
+
+        private static GeoLocationInfo BuildGeoInfo(string countryCode, string rawCountry, string rawRegion, string rawCity, string isp, string asn, string source)
         {
             string code = (countryCode ?? "").Trim().ToUpperInvariant();
             string country = TranslateCountry(code, rawCountry);
@@ -772,6 +810,7 @@ namespace LatencyMonitor
                 Region = region,
                 City = city,
                 Isp = (isp ?? "").Trim(),
+                Asn = (asn ?? "").Trim(),
                 Source = source,
                 DisplayText = display,
                 UpdatedAt = DateTime.Now
@@ -2178,7 +2217,8 @@ namespace LatencyMonitor
                     Console.WriteLine(string.Format("{0}: success={1}, ms={2}, detail={3}", t.Name, res.Success, res.LatencyMs, res.Detail));
                 }
                 var geo = GeoLocationFetcher.FetchAsync(cfg.TimeoutMs).GetAwaiter().GetResult();
-                Console.WriteLine(string.Format("Geo: success={0}, display={1}, source={2}", geo.Success, geo.DisplayText, geo.Source));
+                Console.WriteLine(string.Format("Geo: success={0}, display={1}, source={2}, isp={3}, asn={4}",
+                    geo.Success, geo.DisplayText, geo.Source, geo.Isp, geo.Asn));
                 return;
             }
 

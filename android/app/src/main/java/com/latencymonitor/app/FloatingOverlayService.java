@@ -27,9 +27,14 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -76,6 +81,17 @@ public class FloatingOverlayService extends Service {
     private final List<LatencyProber.ProbeResult> lastResults = new ArrayList<>();
     private TextView geoTextView;
     private GeoLocationFetcher.GeoInfo lastGeo;
+
+    /** 每个目标的最近 20 次成功延迟（按目标名保存，重绘悬浮窗不丢失）。 */
+    private final Map<String, ArrayDeque<Long>> historyByTarget = new LinkedHashMap<>();
+    private final Map<String, String> lastCheckedByTarget = new LinkedHashMap<>();
+
+    private static final int DETAIL_NONE = -1;
+    private static final int DETAIL_GEO = -2;
+    /** 当前展开详情的行：0..n-1 = 目标行，DETAIL_GEO = 地域行，DETAIL_NONE = 全部收起。 */
+    private int detailRow = DETAIL_NONE;
+    private TextView detailBodyView;
+    private TextView geoDetailView;
 
     private volatile boolean isProbing = false;
     private volatile boolean isFetchingGeo = false;
@@ -244,6 +260,8 @@ public class FloatingOverlayService extends Service {
         targetDots.clear();
         targetValues.clear();
         geoTextView = null;
+        detailBodyView = null;
+        geoDetailView = null;
 
         layoutParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -412,7 +430,20 @@ public class FloatingOverlayService extends Service {
 
             targetDots.add(dot);
             targetValues.add(valTv);
+
+            final int index = i;
+            attachTouchHandler(row, new Runnable() {
+                @Override
+                public void run() {
+                    detailRow = (detailRow == index) ? DETAIL_NONE : index;
+                    rebuildOverlay();
+                }
+            });
             root.addView(row, rowLp);
+
+            if (detailRow == i) {
+                root.addView(buildTargetDetail(i, t), createDetailParams());
+            }
         }
 
         // Compact geographic location footer (NO IP)
@@ -437,9 +468,147 @@ public class FloatingOverlayService extends Service {
         geoTextView.setMaxWidth(dp(110));
         geoRow.addView(geoTextView);
 
+        attachTouchHandler(geoRow, new Runnable() {
+            @Override
+            public void run() {
+                detailRow = (detailRow == DETAIL_GEO) ? DETAIL_NONE : DETAIL_GEO;
+                rebuildOverlay();
+            }
+        });
         root.addView(geoRow);
 
+        if (detailRow == DETAIL_GEO) {
+            root.addView(buildGeoDetail(), createDetailParams());
+        }
+
         return root;
+    }
+
+    private LinearLayout.LayoutParams createDetailParams() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(3);
+        lp.bottomMargin = dp(1);
+        return lp;
+    }
+
+    /** 目标行展开后的详细信息：目标地址、当前状态、更新时间、最近 20 次统计。 */
+    private View buildTargetDetail(int index, AppConfig.Target t) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(10), dp(3), dp(2), dp(3));
+
+        detailBodyView = createDetailText();
+        box.addView(detailBodyView);
+        refreshTargetDetail(index);
+        return box;
+    }
+
+    /** 地域行展开后的详细信息：国家/省/市/运营商/ASN/来源（始终不显示 IP）。 */
+    private View buildGeoDetail() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(10), dp(3), dp(2), dp(3));
+
+        geoDetailView = createDetailText();
+        box.addView(geoDetailView);
+        refreshGeoDetail();
+        return box;
+    }
+
+    private TextView createDetailText() {
+        TextView tv = new TextView(this);
+        tv.setTextColor(COLOR_MUTED);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 8.5f);
+        tv.setIncludeFontPadding(false);
+        tv.setLineSpacing(dp(1), 1f);
+        tv.setMaxWidth(dp(208));
+        return tv;
+    }
+
+    private void refreshTargetDetail(int index) {
+        if (detailBodyView == null) return;
+        List<AppConfig.Target> targets = config.getTargets();
+        if (index < 0 || index >= targets.size()) return;
+        AppConfig.Target t = targets.get(index);
+
+        LatencyProber.ProbeResult res = index < lastResults.size() ? lastResults.get(index) : null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("目标 ").append(t.url);
+        sb.append('\n');
+        if (res == null) {
+            sb.append("状态 等待测速...");
+        } else if (res.success) {
+            sb.append("当前 ").append(res.latencyMs).append("ms (").append(res.detail).append(')');
+        } else {
+            sb.append("状态 失败 (").append(res.detail).append(')');
+        }
+        sb.append('\n');
+        String checked = lastCheckedByTarget.get(t.name);
+        sb.append("时间 ").append(checked == null ? "--:--:--" : checked);
+        sb.append('\n');
+        sb.append(statsLine(t.name));
+
+        detailBodyView.setText(sb.toString());
+    }
+
+    private void refreshGeoDetail() {
+        if (geoDetailView == null) return;
+        StringBuilder sb = new StringBuilder();
+        if (lastGeo == null) {
+            sb.append("状态 定位中...");
+        } else if (!lastGeo.success) {
+            sb.append("状态 暂无法获取地域信息");
+        } else {
+            if (!lastGeo.country.isEmpty()) sb.append("国家/地区 ").append(lastGeo.country).append('\n');
+            if (!lastGeo.region.isEmpty()) sb.append("省份/州 ").append(lastGeo.region).append('\n');
+            if (!lastGeo.city.isEmpty()) sb.append("城市 ").append(lastGeo.city).append('\n');
+            if (!lastGeo.isp.isEmpty()) sb.append("运营商 ").append(lastGeo.isp).append('\n');
+            if (!lastGeo.asn.isEmpty()) sb.append("ASN ").append(lastGeo.asn).append('\n');
+            sb.append("来源 ").append(lastGeo.source).append(" · ")
+                    .append(new SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(new Date(lastGeo.updatedAt)));
+        }
+        geoDetailView.setText(sb.toString());
+    }
+
+    private String statsLine(String targetName) {
+        ArrayDeque<Long> q = historyByTarget.get(targetName);
+        if (q == null || q.isEmpty()) {
+            return "统计 数据不足";
+        }
+        long min = Long.MAX_VALUE;
+        long max = Long.MIN_VALUE;
+        long sum = 0;
+        for (Long v : q) {
+            if (v == null) continue;
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sum += v;
+        }
+        long avg = sum / q.size();
+        return "近 " + q.size() + " 次 平均 " + avg + "ms · 最低 " + min + "ms · 最高 " + max + "ms";
+    }
+
+    private void recordResults(List<LatencyProber.ProbeResult> results) {
+        List<AppConfig.Target> targets = config.getTargets();
+        String now = new SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(new Date());
+        for (int i = 0; i < targets.size() && i < results.size(); i++) {
+            AppConfig.Target t = targets.get(i);
+            LatencyProber.ProbeResult r = results.get(i);
+            lastCheckedByTarget.put(t.name, now);
+            if (r != null && r.success) {
+                ArrayDeque<Long> q = historyByTarget.get(t.name);
+                if (q == null) {
+                    q = new ArrayDeque<>();
+                    historyByTarget.put(t.name, q);
+                }
+                q.addLast(r.latencyMs);
+                while (q.size() > 20) {
+                    q.removeFirst();
+                }
+            }
+        }
     }
 
     private TextView createModeBadge() {
@@ -502,6 +671,14 @@ public class FloatingOverlayService extends Service {
     }
 
     private void attachTouchHandler(View view) {
+        attachTouchHandler(view, null);
+    }
+
+    /**
+     * 统一的拖动 + 点击处理：拖动移动悬浮窗，松手未移动时执行 onTap（为空则切换展开/收起）。
+     * 目标行与地域行都用它，保证从任何位置都能拖动窗口。
+     */
+    private void attachTouchHandler(View view, final Runnable onTap) {
         view.setOnTouchListener(new View.OnTouchListener() {
             private int initialX;
             private int initialY;
@@ -544,8 +721,10 @@ public class FloatingOverlayService extends Service {
                             config.overlayX = layoutParams.x;
                             config.overlayY = layoutParams.y;
                             AppConfig.savePosition(FloatingOverlayService.this, layoutParams.x, layoutParams.y);
+                        } else if (onTap != null) {
+                            onTap.run();
                         } else {
-                            // Single tap toggles between compact region pill and expanded detail card
+                            // 单击空白处：在紧凑地域胶囊与详情卡片之间切换
                             toggleExpand();
                         }
                         return true;
@@ -598,6 +777,7 @@ public class FloatingOverlayService extends Service {
                         public void run() {
                             lastResults.clear();
                             lastResults.addAll(results);
+                            recordResults(results);
                             applyAllResultsToUi();
                         }
                     });
@@ -677,6 +857,10 @@ public class FloatingOverlayService extends Service {
                 setDotColor(dot, color);
             }
         }
+
+        if (detailRow >= 0) {
+            refreshTargetDetail(detailRow);
+        }
     }
 
     private void applyGeoToUi() {
@@ -690,6 +874,10 @@ public class FloatingOverlayService extends Service {
         } else {
             geoTextView.setText(lastGeo.displayText);
             geoTextView.setTextColor(COLOR_GEO_TEXT);
+        }
+
+        if (detailRow == DETAIL_GEO) {
+            refreshGeoDetail();
         }
     }
 
