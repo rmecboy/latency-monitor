@@ -38,7 +38,11 @@ final class MonitorViewModel: ObservableObject {
         self.mode = ud.string(forKey: "mode") ?? "HTTPS"
         let savedInterval = ud.integer(forKey: "interval_sec")
         self.intervalSec = savedInterval >= 2 ? savedInterval : 3
-        self.compactHorizontal = ud.bool(forKey: "compact_horizontal")
+        if ud.object(forKey: "compact_horizontal") != nil {
+            self.compactHorizontal = ud.bool(forKey: "compact_horizontal")
+        } else {
+            self.compactHorizontal = true
+        }
         if ud.object(forKey: "show_geo_location") != nil {
             self.showGeoLocation = ud.bool(forKey: "show_geo_location")
         } else {
@@ -50,6 +54,11 @@ final class MonitorViewModel: ObservableObject {
 
         pipManager.$isPiPActive.assign(to: &$isPiPActive)
         pipManager.$statusMessage.assign(to: &$pipStatus)
+        pipManager.onToggleCompact = { [weak self] in
+            Task { @MainActor in
+                self?.compactHorizontal.toggle()
+            }
+        }
     }
 
     var targets: [TargetItem] {
@@ -234,10 +243,10 @@ struct ContentView: View {
                     VStack(spacing: 12) {
                         PiPPreviewRepresentable(hostView: vm.pipManager.hostView)
                             .frame(maxWidth: .infinity)
-                            .frame(height: vm.compactHorizontal ? 76 : 210)
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .frame(height: vm.compactHorizontal ? 44 : 210)
+                            .clipShape(RoundedRectangle(cornerRadius: vm.compactHorizontal ? 22 : 12, style: .continuous))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                RoundedRectangle(cornerRadius: vm.compactHorizontal ? 22 : 12, style: .continuous)
                                     .stroke(Color.white.opacity(0.16), lineWidth: 1)
                             )
 
@@ -317,7 +326,7 @@ struct ContentView: View {
                             .pickerStyle(.segmented)
                         }
 
-                        Toggle("横向迷你条布局", isOn: $vm.compactHorizontal)
+                        Toggle("超扁单行胶囊模式（关闭则显示详细纵卡）", isOn: $vm.compactHorizontal)
                             .foregroundColor(.white)
                             .tint(Color(red: 52.0 / 255.0, green: 211.0 / 255.0, blue: 153.0 / 255.0))
 

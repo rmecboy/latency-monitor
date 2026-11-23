@@ -39,9 +39,11 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
     @Published var isPiPActive: Bool = false
     @Published var statusMessage: String = ""
 
-    let hostView = SampleBufferHostView(frame: CGRect(x: 0, y: 0, width: 240, height: 138))
+    let hostView = SampleBufferHostView(frame: CGRect(x: 0, y: 0, width: 320, height: 30))
     private var pipController: AVPictureInPictureController?
     private var isConfigured = false
+    private var lastFrameSize: CGSize = .zero
+    var onToggleCompact: (() -> Void)?
 
     override init() {
         super.init()
@@ -153,20 +155,32 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
         )
 
         guard let sampleBuffer = makeSampleBuffer(from: image) else { return }
+        let newSize = image.size
 
         DispatchQueue.main.async {
             let layer = self.hostView.displayLayer
+            let sizeChanged = self.lastFrameSize != .zero && self.lastFrameSize != newSize
+            self.lastFrameSize = newSize
+
             if #available(iOS 17.0, *) {
                 let renderer = layer.sampleBufferRenderer
-                if renderer.status == .failed {
+                if sizeChanged {
+                    renderer.flush(removingDisplayedImage: true, completionHandler: nil)
+                } else if renderer.status == .failed {
                     renderer.flush()
                 }
                 renderer.enqueue(sampleBuffer)
             } else {
-                if layer.status == .failed {
+                if sizeChanged {
+                    layer.flushAndRemoveImage()
+                } else if layer.status == .failed {
                     layer.flush()
                 }
                 layer.enqueue(sampleBuffer)
+            }
+
+            if sizeChanged {
+                self.pipController?.invalidatePlaybackState()
             }
         }
     }
@@ -202,7 +216,11 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
     func pictureInPictureController(
         _ pictureInPictureController: AVPictureInPictureController,
         setPlaying playing: Bool
-    ) {}
+    ) {
+        DispatchQueue.main.async {
+            self.onToggleCompact?()
+        }
+    }
 
     func pictureInPictureControllerTimeRangeForPlayback(
         _ pictureInPictureController: AVPictureInPictureController
@@ -411,6 +429,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
         }
     }
 
+    /// 超扁单行胶囊模式：地域与 G / CF / OCI 全部压缩在一行内，最大限度降低 iPadOS 画中画高度
     private func renderHorizontalBar(
         targets: [TargetItem],
         results: [String: ProbeResult],
@@ -418,7 +437,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
         geoSuccess: Bool,
         showGeo: Bool
     ) -> UIImage {
-        let size = CGSize(width: 640, height: 120)
+        let size = showGeo ? CGSize(width: 720, height: 64) : CGSize(width: 520, height: 60)
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1.0
         format.opaque = true
@@ -427,42 +446,72 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
         return renderer.image { ctx in
             let cg = ctx.cgContext
             let bgColor = UIColor(red: 20.0 / 255.0, green: 23.0 / 255.0, blue: 31.0 / 255.0, alpha: 1.0)
-            let nameColor = UIColor(red: 241.0 / 255.0, green: 245.0 / 255.0, blue: 249.0 / 255.0, alpha: 1.0)
+            let labelColor = UIColor(red: 203.0 / 255.0, green: 213.0 / 255.0, blue: 225.0 / 255.0, alpha: 1.0)
             let geoPinColor = UIColor(red: 56.0 / 255.0, green: 189.0 / 255.0, blue: 248.0 / 255.0, alpha: 1.0)
-            let geoTextColor = UIColor(red: 203.0 / 255.0, green: 213.0 / 255.0, blue: 225.0 / 255.0, alpha: 1.0)
-            let dividerColor = UIColor(white: 1.0, alpha: 0.16)
+            let geoTextColor = UIColor(red: 241.0 / 255.0, green: 245.0 / 255.0, blue: 249.0 / 255.0, alpha: 1.0)
+            let mutedColor = UIColor(red: 148.0 / 255.0, green: 163.0 / 255.0, blue: 184.0 / 255.0, alpha: 1.0)
+            let dividerColor = UIColor(white: 1.0, alpha: 0.18)
+            let borderColor = UIColor(white: 1.0, alpha: 0.14)
 
             bgColor.setFill()
             cg.fill(CGRect(origin: .zero, size: size))
 
-            let topY: CGFloat = showGeo ? 18 : 42
+            // Subtle capsule inner border
+            let capsulePath = UIBezierPath(
+                roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 1.0, dy: 1.0),
+                cornerRadius: (size.height - 2.0) / 2.0
+            )
+            borderColor.setStroke()
+            capsulePath.lineWidth = 1.5
+            capsulePath.stroke()
+
+            let midY = size.height / 2.0
+            var cursorX: CGFloat = 18
 
             if showGeo {
-                geoPinColor.setFill()
-                cg.fillEllipse(in: CGRect(x: 24, y: topY + 6, width: 12, height: 12))
+                let compactGeo = geoText.replacingOccurrences(of: " · ", with: "·")
+                let pinColor = geoSuccess ? geoPinColor : mutedColor
+                pinColor.setFill()
+                cg.fillEllipse(in: CGRect(x: cursorX, y: midY - 5, width: 10, height: 10))
+                cursorX += 16
+
+                let geoParagraph = NSMutableParagraphStyle()
+                geoParagraph.lineBreakMode = .byTruncatingTail
+                let geoFont = UIFont.systemFont(ofSize: 22, weight: .semibold)
                 let geoAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: 22, weight: .semibold),
-                    .foregroundColor: geoTextColor
+                    .font: geoFont,
+                    .foregroundColor: geoSuccess ? geoTextColor : mutedColor,
+                    .paragraphStyle: geoParagraph
                 ]
-                NSString(string: geoText).draw(
-                    in: CGRect(x: 46, y: topY - 2, width: size.width - 70, height: 30),
+                let nsGeo = NSString(string: compactGeo)
+                let measured = nsGeo.size(withAttributes: geoAttrs)
+                let geoW = min(186, measured.width + 2)
+                nsGeo.draw(
+                    in: CGRect(x: cursorX, y: midY - measured.height / 2.0, width: geoW, height: measured.height),
                     withAttributes: geoAttrs
                 )
+                cursorX += geoW + 12
 
                 dividerColor.setFill()
-                cg.fill(CGRect(x: 24, y: 56, width: size.width - 48, height: 2))
+                cg.fill(CGRect(x: cursorX, y: midY - 13, width: 1.5, height: 26))
+                cursorX += 14
             }
 
-            let rowY: CGFloat = showGeo ? 70 : 42
-            let colWidth = (size.width - 48) / CGFloat(max(1, targets.count))
+            let count = max(1, targets.count)
+            let rightPad: CGFloat = 16
+            let availableW = max(120, size.width - cursorX - rightPad)
+            let colW = availableW / CGFloat(count)
+
+            let nameFont = UIFont.systemFont(ofSize: 20, weight: .medium)
+            let valFont = UIFont.monospacedDigitSystemFont(ofSize: 22, weight: .bold)
 
             for (index, target) in targets.enumerated() {
-                let x = 24 + CGFloat(index) * colWidth
+                let x = cursorX + CGFloat(index) * colW
                 let res = results[target.id]
                 let color = latencyUIColor(result: res)
 
                 color.setFill()
-                cg.fillEllipse(in: CGRect(x: x, y: rowY + 9, width: 12, height: 12))
+                cg.fillEllipse(in: CGRect(x: x, y: midY - 4.5, width: 9, height: 9))
 
                 let short = target.name == "Google" ? "G" : (target.name == "Cloudflare" ? "CF" : (target.name == "Oracle" ? "OCI" : target.name))
                 let valStr: String
@@ -473,17 +522,21 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureController
                 }
 
                 let nameAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: 23, weight: .medium),
-                    .foregroundColor: nameColor
+                    .font: nameFont,
+                    .foregroundColor: labelColor
                 ]
                 let valAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.monospacedDigitSystemFont(ofSize: 23, weight: .bold),
+                    .font: valFont,
                     .foregroundColor: color
                 ]
 
-                let labelSize = NSString(string: short).size(withAttributes: nameAttrs)
-                NSString(string: short).draw(at: CGPoint(x: x + 20, y: rowY), withAttributes: nameAttrs)
-                NSString(string: valStr).draw(at: CGPoint(x: x + 28 + labelSize.width, y: rowY), withAttributes: valAttrs)
+                let nsShort = NSString(string: short)
+                let nsVal = NSString(string: valStr)
+                let nSize = nsShort.size(withAttributes: nameAttrs)
+                let vSize = nsVal.size(withAttributes: valAttrs)
+
+                nsShort.draw(at: CGPoint(x: x + 14, y: midY - nSize.height / 2.0), withAttributes: nameAttrs)
+                nsVal.draw(at: CGPoint(x: x + 19 + nSize.width, y: midY - vSize.height / 2.0), withAttributes: valAttrs)
             }
         }
     }

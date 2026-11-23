@@ -17,8 +17,8 @@ targets:
       base:
         PRODUCT_NAME: LatencyMonitor
         PRODUCT_BUNDLE_IDENTIFIER: com.latencymonitor.app
-        MARKETING_VERSION: "1.2.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "1.2.1"
+        CURRENT_PROJECT_VERSION: "3"
         INFOPLIST_FILE: Sources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_VERSION: "5.0"
