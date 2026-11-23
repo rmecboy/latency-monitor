@@ -65,6 +65,8 @@ namespace LatencyMonitor
         public bool CompactHorizontal { get; set; }
         public bool ShowGeoLocation { get; set; }
         public int GeoIntervalMs { get; set; }
+        public int GreenMaxMs { get; set; }
+        public int YellowMaxMs { get; set; }
         public double WindowLeft { get; set; }
         public double WindowTop { get; set; }
         public List<TargetConfig> Targets { get; set; }
@@ -79,6 +81,8 @@ namespace LatencyMonitor
             CompactHorizontal = false;
             ShowGeoLocation = true;
             GeoIntervalMs = 15000;
+            GreenMaxMs = 800;
+            YellowMaxMs = 1500;
             WindowLeft = -1;
             WindowTop = -1;
             Targets = new List<TargetConfig>();
@@ -941,6 +945,9 @@ namespace LatencyMonitor
                 if (cfg.IntervalMs < 500) cfg.IntervalMs = 2000;
                 if (cfg.TimeoutMs < 500) cfg.TimeoutMs = 3000;
                 if (cfg.GeoIntervalMs < 5000) cfg.GeoIntervalMs = 15000;
+                if (cfg.GreenMaxMs <= 0) cfg.GreenMaxMs = 800;
+                if (cfg.YellowMaxMs <= 0) cfg.YellowMaxMs = 1500;
+                if (cfg.YellowMaxMs < cfg.GreenMaxMs) cfg.YellowMaxMs = cfg.GreenMaxMs;
                 if (cfg.Opacity < 0.3 || cfg.Opacity > 1.0) cfg.Opacity = 0.92;
                 if (string.IsNullOrWhiteSpace(cfg.Mode)) cfg.Mode = "HTTPS";
                 return cfg;
@@ -966,6 +973,8 @@ namespace LatencyMonitor
                 sb.AppendFormat("  \"CompactHorizontal\": {0},\r\n", cfg.CompactHorizontal ? "true" : "false");
                 sb.AppendFormat("  \"ShowGeoLocation\": {0},\r\n", cfg.ShowGeoLocation ? "true" : "false");
                 sb.AppendFormat("  \"GeoIntervalMs\": {0},\r\n", cfg.GeoIntervalMs);
+                sb.AppendFormat("  \"GreenMaxMs\": {0},\r\n", cfg.GreenMaxMs);
+                sb.AppendFormat("  \"YellowMaxMs\": {0},\r\n", cfg.YellowMaxMs);
                 sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "  \"WindowLeft\": {0:0},\r\n", cfg.WindowLeft);
                 sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "  \"WindowTop\": {0:0},\r\n", cfg.WindowTop);
                 sb.AppendLine("  \"Targets\": [");
@@ -1700,6 +1709,15 @@ namespace LatencyMonitor
             opacityMenu.Items.Add(CreateOpacityItem("65%", 0.65));
             menu.Items.Add(opacityMenu);
 
+            var thresholdMenu = new MenuItem { Header = string.Format("颜色阈值 (绿<{0} / 黄≤{1} ms)", _config.GreenMaxMs, _config.YellowMaxMs) };
+            thresholdMenu.Items.Add(CreateThresholdItem("严格: 绿<100 / 黄≤300 ms", 100, 300));
+            thresholdMenu.Items.Add(CreateThresholdItem("标准: 绿<300 / 黄≤600 ms", 300, 600));
+            thresholdMenu.Items.Add(CreateThresholdItem("宽松: 绿<500 / 黄≤1000 ms", 500, 1000));
+            thresholdMenu.Items.Add(CreateThresholdItem("默认: 绿<800 / 黄≤1500 ms", 800, 1500));
+            thresholdMenu.Items.Add(new Separator());
+            thresholdMenu.Items.Add(new MenuItem { Header = "自定义: 编辑 config.json 的 GreenMaxMs / YellowMaxMs", IsEnabled = false });
+            menu.Items.Add(thresholdMenu);
+
             menu.Items.Add(new Separator());
 
             var layoutItem = new MenuItem
@@ -1810,6 +1828,25 @@ namespace LatencyMonitor
                 {
                     _timer.Interval = TimeSpan.FromMilliseconds(ms);
                 }
+                _cardBorder.ContextMenu = BuildContextMenu();
+            };
+            return item;
+        }
+
+        private MenuItem CreateThresholdItem(string label, int greenMax, int yellowMax)
+        {
+            var item = new MenuItem
+            {
+                Header = label,
+                IsCheckable = true,
+                IsChecked = _config.GreenMaxMs == greenMax && _config.YellowMaxMs == yellowMax
+            };
+            item.Click += delegate
+            {
+                _config.GreenMaxMs = greenMax;
+                _config.YellowMaxMs = yellowMax;
+                ConfigManager.Save(_config);
+                foreach (var s in _states) ApplyStateVisuals(s);
                 _cardBorder.ContextMenu = BuildContextMenu();
             };
             return item;
@@ -2041,11 +2078,11 @@ namespace LatencyMonitor
                 state.ValueText.Text = string.Format("{0} ms", ms);
 
                 WpfBrush colorBrush;
-                if (ms < 800)
+                if (ms < _config.GreenMaxMs)
                 {
                     colorBrush = BrushGreen;
                 }
-                else if (ms <= 1500)
+                else if (ms <= _config.YellowMaxMs)
                 {
                     colorBrush = BrushAmber;
                 }

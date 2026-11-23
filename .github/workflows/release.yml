@@ -140,6 +140,12 @@ jobs:
 
             实时显示 **Google / Cloudflare / Oracle** 延迟（`< 800ms` 绿色）与当前网络地域（不显示 IP）。
 
+            ### v1.2.2 更新：Windows 颜色阈值可调
+
+            **Windows (`LatencyMonitor.exe`)**
+            - 右键菜单新增**颜色阈值**预设：严格 / 标准 / 宽松 / 默认
+            - 支持在 `config.json` 中通过 `GreenMaxMs` / `YellowMaxMs` 自定义阈值
+
             ### v1.2.1 更新：iPadOS / iOS 超扁单行胶囊模式
 
             **iOS / iPadOS (`LatencyMonitor.ipa`)**
